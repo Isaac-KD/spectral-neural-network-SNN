@@ -1,10 +1,16 @@
 import torch
 import torch.nn as nn
 import torch.nn.init as init
-    
+from typing import Optional, List, Callable, Union
 
 class SpectralQuadraticLayer(nn.Module):
-    def __init__(self, in_features, out_features, ortho_mode='hard',bias=True):
+    def __init__(
+        self, 
+        in_features: int,          
+        out_features: int, 
+        ortho_mode: str = 'hard', 
+        bias: bool = True
+    ):
         """
         Args:
             in_features (int): Dimension d'entrée
@@ -15,6 +21,11 @@ class SpectralQuadraticLayer(nn.Module):
                 - None  : Pas d'orthogonalité.
         """
         super().__init__()
+
+        # 1. Defensive Programming : On valide les entrées tout de suite
+        valid_modes = {'hard', 'cayley', 'soft', None}
+        assert ortho_mode in valid_modes, f"Mode invalide: {ortho_mode}. Choisir parmi {valid_modes}"
+
         self.in_features = in_features
         self.ortho_mode = ortho_mode
         
@@ -38,7 +49,7 @@ class SpectralQuadraticLayer(nn.Module):
         elif self.ortho_mode == 'soft':
             # Initialisation orthogonale de départ, mais liberté d'évolution ensuite
             init.orthogonal_(self.base_change.weight)
-            # OPTIMISATION 1 : On pré-calcule la matrice identité pour éviter de la 
+            # OPTIMISATION : On pré-calcule la matrice identité pour éviter de la 
             # recréer à chaque appel de get_ortho_loss. 
             # 'persistent=False' signifie qu'elle ne sera pas sauvegardée dans le state_dict (pas besoin de la save).
             self.register_buffer('eye_target', torch.eye(in_features), persistent=False)
@@ -52,14 +63,14 @@ class SpectralQuadraticLayer(nn.Module):
         # Initialisation personnalisée
         self._init_parameters()
 
-    def _init_parameters(self):
+    def _init_parameters(self)-> None:
         # Initialisation spéciale pour les lambdas pour éviter l'explosion initiale
         # On initialise proche de zéro ou avec une petite variance
         init.normal_(self.eigen_weights.weight, mean=0.0, std=0.01)
         init.zeros_(self.eigen_weights.bias)
         if self.base_change.bias is not None: init.zeros_(self.base_change.bias)
 
-    def get_ortho_loss(self, loss_fn):
+    def get_ortho_loss(self, loss_fn: Callable) -> torch.Tensor:
         """
         Calcule la perte d'orthogonalité pour le mode 'soft'.
         
@@ -68,7 +79,7 @@ class SpectralQuadraticLayer(nn.Module):
                                 Par défaut : Mean Squared Error.
         """
         if self.ortho_mode != 'soft':
-            return 0.0
+            return torch.tensor(0.0, device=self.base_change.weight.device)
             
         w = self.base_change.weight
         gram = torch.mm(w, w.t())
@@ -92,36 +103,22 @@ class SpectralQuadraticLayer(nn.Module):
         
         return y
     
-    def get_param_count(self):
-        """
-        Retourne le nombre de paramètres entraînables dans cette couche.
-        """
+    @property
+    def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
-    
-class DeepSpectralNet(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, depth=3):
-        super().__init__()
-        layers = []
-        
-        # Entrée -> Hidden
-        layers.append(SpectralQuadraticLayer(input_dim, hidden_dim))
-        
-        # Hidden -> Hidden (Profondeur)
-        for _ in range(depth):
-            layers.append(SpectralQuadraticLayer(hidden_dim, hidden_dim))
-            # Note: On peut ajouter une Normalisation ici pour stabiliser les carrés successifs
-            layers.append(nn.LayerNorm(hidden_dim)) 
-            
-        # Hidden -> Output
-        layers.append(SpectralQuadraticLayer(hidden_dim, output_dim)) # Couche finale linéaire standard ou quadratique
-        
-        self.net = nn.Sequential(*layers)
 
-    def forward(self, x):
-        return self.net(x)
+    def extra_repr(self) -> str:
+        return f'in_features={self.in_features}, out_features={self.out_features}, mode={self.ortho_mode}'
 
 class DeepSpectralNet(nn.Module):
-    def __init__(self, layers_dim, ortho_mode='cayley', use_final_linear=False, bias=True,use_layernorm=False):
+    def __init__(
+        self, 
+        layers_dim: List[int],          
+        ortho_mode: str = 'hard', 
+        use_final_linear: bool = False, 
+        bias: bool = True, 
+        use_layernorm: bool = False
+    ):
         """
         Args:
             layers_dim (list): Liste des dimensions [in, hidden, ..., out].
@@ -133,7 +130,9 @@ class DeepSpectralNet(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList()
         self.use_layernorm = use_layernorm
-        
+
+        assert len(layers_dim) >= 2, "Il faut au moins une dimension d'entrée et de sortie"
+
         num_layers = len(layers_dim) - 1
         
         for i in range(num_layers):
@@ -155,19 +154,20 @@ class DeepSpectralNet(nn.Module):
                 if not is_last_layer and self.use_layernorm:
                     self.layers.append(nn.LayerNorm(out_d))
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
             x = layer(x)
         return x
 
-    def get_total_ortho_loss(self, loss_fn):
+    def get_total_ortho_loss(self, loss_fn: Callable) -> torch.Tensor:
         """Récupère la loss d'orthogonalité totale du réseau."""
-        total_loss = 0.0
+        device = next(self.parameters()).device
+        total_loss = torch.tensor(0.0, device=device)
         for layer in self.layers:
             if isinstance(layer, SpectralQuadraticLayer):
                 total_loss += layer.get_ortho_loss(loss_fn)
         return total_loss
 
-    def get_param_count(self):
-        """Retourne le nombre total de paramètres du réseau."""
+    @property
+    def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
