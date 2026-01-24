@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.init as init
-from typing import Optional, List, Callable, Union
+from typing import List, Callable
 
 class SpectralQuadraticLayer(nn.Module):
     def __init__(
@@ -65,8 +65,8 @@ class SpectralQuadraticLayer(nn.Module):
 
     def _init_parameters(self)-> None:
         # Initialisation spéciale pour les lambdas pour éviter l'explosion initiale
-        # On initialise proche de zéro ou avec une petite variance
-        init.normal_(self.eigen_weights.weight, mean=0.0, std=0.01)
+        nn.init.xavier_uniform_(self.base_change.weight, gain=1.5)
+        nn.init.xavier_uniform_(self.eigen_weights.weight, gain=1.5)
         init.zeros_(self.eigen_weights.bias)
         if self.base_change.bias is not None: init.zeros_(self.base_change.bias)
 
@@ -114,7 +114,7 @@ class DeepSpectralNet(nn.Module):
     def __init__(
         self, 
         layers_dim: List[int],          
-        ortho_mode: str = 'hard', 
+        ortho_mode: str = None, 
         use_final_linear: bool = False, 
         bias: bool = True, 
         use_layernorm: bool = False
