@@ -171,3 +171,326 @@ class DeepSpectralNet(nn.Module):
     @property
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class MultiHeadSpectralLayer(nn.Module):
+    """
+    Couche Spectrale Multi-Têtes (Pure).
+    
+    Principe :
+    1. L'entrée est envoyée à N têtes parallèles.
+    2. Chaque tête est une 'SpectralQuadraticLayer' indépendante.
+       Elle observe tout le contexte (in_features) mais projette vers une dimension réduite (head_dim).
+    3. Les sorties sont concaténées pour reconstituer la dimension d'origine.
+    
+    Aucun MLP, aucune autre transformation n'est ajoutée.
+    """
+    def __init__(
+        self, 
+        in_features: int, 
+        num_heads: int, 
+        ortho_mode: str = 'hard',
+        bias: bool = True
+    ):
+        super().__init__()
+        
+        # Vérification des dimensions
+        if in_features % num_heads != 0:
+            raise ValueError(f"in_features ({in_features}) doit être divisible par num_heads ({num_heads})")
+        
+        self.in_features = in_features
+        self.num_heads = num_heads
+        self.head_dim = in_features // num_heads
+        
+        # Création des têtes spectrales parallèles
+        # Chaque tête : Input (Full) -> Projection Orthogonale -> Carré -> Output (Partiel)
+        self.heads = nn.ModuleList([
+            SpectralQuadraticLayer(
+                in_features=in_features, 
+                out_features=self.head_dim, 
+                ortho_mode=ortho_mode, 
+                bias=bias
+            ) 
+            for _ in range(num_heads)
+        ])
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (Batch, ..., In_Features)
+        
+        # 1. Application parallèle des têtes
+        # Chaque tête renvoie un tenseur de forme (Batch, ..., Head_Dim)
+        head_outputs = [head(x) for head in self.heads]
+        
+        # 2. Concaténation pure et simple
+        # On reconstitue le vecteur complet : (Batch, ..., In_Features)
+        output = torch.cat(head_outputs, dim=-1)
+        
+        return output
+
+    def get_ortho_loss(self, loss_fn: Callable) -> torch.Tensor:
+        """Somme des pertes d'orthogonalité de chaque tête."""
+        total_loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        for head in self.heads:
+            total_loss += head.get_ortho_loss(loss_fn)
+        return total_loss
+
+
+class DeepMultiHeadSpectralNet(nn.Module):
+    """
+    Réseau Profond 'Pure DSN'.
+    Empilement de couches Multi-Head Spectrales sans MLP intermédiaires.
+    
+    Structure par bloc :
+    Input -> [MultiHeadSpectralLayer] -> (Optionnel: Norm/Residual) -> Output
+    """
+    def __init__(
+        self, 
+        dim: int,
+        num_layers: int,
+        num_heads: int,
+        ortho_mode: str = 'hard',
+        use_residuals: bool = True,
+        use_layernorm: bool = True
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        self.use_residuals = use_residuals
+        self.use_layernorm = use_layernorm
+        
+        for _ in range(num_layers):
+            self.layers.append(
+                MultiHeadSpectralLayer(
+                    in_features=dim, 
+                    num_heads=num_heads, 
+                    ortho_mode=ortho_mode
+                )
+            )
+            # Normalisation optionnelle pour éviter l'explosion des gradients 
+            # (les réseaux polynomiaux sont sensibles à la profondeur)
+            if use_layernorm:
+                self.layers.append(nn.LayerNorm(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            if isinstance(layer, MultiHeadSpectralLayer):
+                # Connexion résiduelle : x = x + Layer(x)
+                # C'est la seule opération "extra" permise pour aider la convergence
+                if self.use_residuals:
+                    x = x + layer(x)
+                else:
+                    x = layer(x)
+            else:
+                # C'est une LayerNorm ou autre utilitaire
+                x = layer(x)
+        return x
+
+    def get_total_ortho_loss(self, loss_fn: Callable) -> torch.Tensor:
+        loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        for layer in self.layers:
+            if isinstance(layer, MultiHeadSpectralLayer):
+                loss += layer.get_ortho_loss(loss_fn)
+        return loss
+
+class MultiBasisSpectralLayer(nn.Module):
+    """
+    Couche Spectrale Multi-Bases.
+    
+    Contrairement à l'approche "Multi-Head" classique qui divise la dimension,
+    cette couche :
+    1. Apprend H bases orthogonales complètes (H matrices de rotation de taille N*N).
+    2. Projette l'entrée sur ces H bases.
+    3. Élève au carré pour obtenir H * N énergies spectrales.
+    4. Chaque neurone de sortie apprend H * N valeurs propres (poids de mélange).
+    """
+    def __init__(
+        self, 
+        in_features: int,          
+        out_features: int, 
+        num_bases: int = 4,   # H bases
+        ortho_mode: str = 'hard', 
+        bias: bool = True
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_bases = num_bases
+        self.ortho_mode = ortho_mode
+
+        # 1. Les H Bases Partagées (Liste de matrices de rotation)
+        # Chaque base est une transformation linéaire complète : In -> In
+        self.bases = nn.ModuleList([
+            nn.Linear(in_features, in_features, bias=bias) 
+            for _ in range(num_bases)
+        ])
+        
+        # Application des contraintes d'orthogonalité sur chaque base
+        for linear_layer in self.bases:
+            if self.ortho_mode == 'hard':
+                torch.nn.utils.parametrizations.orthogonal(linear_layer, "weight")
+            elif self.ortho_mode == 'cayley':
+                torch.nn.utils.parametrizations.orthogonal(linear_layer, "weight", orthogonal_map='cayley')
+            elif self.ortho_mode == 'soft':
+                init.orthogonal_(linear_layer.weight)
+        
+        if self.ortho_mode == 'soft':
+            self.register_buffer('eye_target', torch.eye(in_features), persistent=False)
+
+        # 2. Les Valeurs Propres (H * K valeurs par neurone de sortie)
+        # L'entrée de cette couche est la concaténation des énergies de toutes les bases.
+        # Taille entrée : in_features * num_bases
+        # Taille sortie : out_features
+        self.eigen_weights = nn.Linear(in_features * num_bases, out_features, bias=True)
+        
+        self._init_parameters()
+
+    def _init_parameters(self) -> None:
+        # Initialisation pour favoriser la convergence
+        for base in self.bases:
+            # On initialise les bases pour qu'elles couvrent bien l'espace
+            if self.ortho_mode not in ['hard', 'cayley']: 
+                init.orthogonal_(base.weight)
+            if base.bias is not None: 
+                init.zeros_(base.bias)
+        
+        # Initialisation Xavier pour les valeurs propres
+        nn.init.xavier_uniform_(self.eigen_weights.weight, gain=1.0)
+        init.zeros_(self.eigen_weights.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (Batch, In_Features)
+        
+        all_energies = []
+        
+        # 1. Calcul des énergies pour chaque base
+        for base in self.bases:
+            # Projection : h = W_i * x
+            h = base(x)
+            # Activation quadratique : e = h^2
+            energy = h * h
+            all_energies.append(energy)
+            
+        # 2. Concaténation de toutes les énergies
+        # Shape: (Batch, In_Features * Num_Bases)
+        combined_energy = torch.cat(all_energies, dim=-1)
+        
+        # 3. Combinaison linéaire (Valeurs propres)
+        # y = Sum( lambda_ijk * energy_jk )
+        y = self.eigen_weights(combined_energy)
+        
+        return y
+
+    def get_ortho_loss(self, loss_fn: Callable) -> torch.Tensor:
+        """Calcule la perte d'orthogonalité cumulée sur les H bases."""
+        if self.ortho_mode != 'soft':
+            return torch.tensor(0.0, device=self.eigen_weights.weight.device)
+            
+        total_loss = torch.tensor(0.0, device=self.eigen_weights.weight.device)
+        
+        for base in self.bases:
+            w = base.weight
+            gram = torch.mm(w, w.t())
+            total_loss += loss_fn(gram, self.eye_target)
+            
+        return total_loss
+
+class DeepMultiBasisNet(nn.Module):
+    """
+    Réseau Profond utilisant l'architecture Multi-Bases avec dimensions variables.
+    
+    Structure flexible définie par `layers_dim`, similaire à un MLP classique
+    mais utilisant des projections spectrales multi-bases.
+    """
+    def __init__(
+        self, 
+        layers_dim: List[int],
+        num_bases: int = 4,
+        ortho_mode: str = 'hard',
+        use_final_linear: bool = False,
+        use_layernorm: bool = True,
+        use_residual: bool = False,
+        bias: bool = True
+    ):
+        """
+        Args:
+            layers_dim (list): Liste des dimensions [in, hidden, ..., out].
+            num_bases (int): Nombre de bases orthogonales par couche (H).
+            ortho_mode (str): 'hard', 'cayley', 'soft', ou None.
+            use_final_linear (bool): Si True, la dernière couche est un nn.Linear standard 
+                                     (utile pour les logits de classification).
+            use_layernorm (bool): Ajoute une LayerNorm après chaque couche spectrale.
+            use_residual (bool): Active les connexions résiduelles (seulement si in_dim == out_dim).
+            bias (bool): Active le biais dans les couches.
+        """
+        super().__init__()
+        self.layers = nn.ModuleList()
+        self.use_layernorm = use_layernorm
+        self.use_residual = use_residual
+        self.use_final_linear = use_final_linear
+
+        assert len(layers_dim) >= 2, "Il faut au moins une dimension d'entrée et de sortie (len >= 2)"
+        
+        num_layers = len(layers_dim) - 1
+        
+        for i in range(num_layers):
+            is_last_layer = (i == num_layers - 1)
+            in_d = layers_dim[i]
+            out_d = layers_dim[i+1]
+            
+            # --- Cas A : Dernière Couche Linéaire Standard ---
+            # Souvent préférable pour projeter vers des logits (valeurs non bornées/négatives)
+            if is_last_layer and use_final_linear:
+                self.layers.append(nn.Linear(in_d, out_d, bias=bias))
+            
+            # --- Cas B : Couche Spectrale Multi-Bases ---
+            else:
+                self.layers.append(
+                    MultiBasisSpectralLayer(
+                        in_features=in_d, 
+                        out_features=out_d, 
+                        num_bases=num_bases, 
+                        ortho_mode=ortho_mode,
+                        bias=bias
+                    )
+                )
+                
+                # Normalisation (Sauf après la toute dernière couche pour ne pas contraindre la sortie)
+                if not is_last_layer and self.use_layernorm:
+                    self.layers.append(nn.LayerNorm(out_d))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # On itère sur les couches.
+        # Attention : self.layers contient un mélange de SpectralLayer et de LayerNorm.
+        
+        for layer in self.layers:
+            # Gestion des connexions résiduelles
+            if isinstance(layer, MultiBasisSpectralLayer):
+                out = layer(x)
+                
+                # On applique le résiduel SEULEMENT si demandé ET si les dimensions correspondent
+                # (Impossible d'additionner x et out si in_features != out_features)
+                if self.use_residual and x.shape == out.shape:
+                    x = x + out
+                else:
+                    x = out
+            else:
+                # C'est soit une LayerNorm, soit un Linear final
+                x = layer(x)
+                
+        return x
+
+    def get_total_ortho_loss(self, loss_fn: Callable) -> torch.Tensor:
+        """Récupère la loss d'orthogonalité de toutes les couches MultiBasis."""
+        device = next(self.parameters()).device
+        loss = torch.tensor(0.0, device=device)
+        
+        for layer in self.layers:
+            if isinstance(layer, MultiBasisSpectralLayer):
+                loss += layer.get_ortho_loss(loss_fn)
+        return loss
+    
+    @property
+    def num_parameters(self) -> int:
+        """Retourne le nombre total de paramètres entraînables."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+    
+    

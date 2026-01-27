@@ -1,18 +1,20 @@
 import torch
 import torch.nn as nn
 import torch.nn.init as init
-from typing import List, Callable
+from typing import List, Callable, Optional
 
 class SpectralBilinearLayer(nn.Module):
     """
-    Version généralisée (bilinéaire) de la couche spectrale.
-    Au lieu de x^T A x (quadratique), elle implémente la somme des termes spectraux :
-    y = Σ λ_k * (x^T p_k) * (l_k^T x)
+    Version Low-Rank Bilinéaire de la couche spectrale.
+    Projection : x (In) -> h (Rank)
+    Interaction : h_right * h_left (Rank)
+    Mélange : h (Rank) -> y (Out)
     """
     def __init__(
         self, 
         in_features: int,          
         out_features: int, 
+        rank: Optional[int] = None, # Nouveau paramètre Low-Rank
         ortho_mode: str = 'hard', 
         bias: bool = True
     ):
@@ -22,14 +24,15 @@ class SpectralBilinearLayer(nn.Module):
         assert ortho_mode in valid_modes, f"Mode invalide: {ortho_mode}"
 
         self.in_features = in_features
+        # Si rank n'est pas spécifié, on utilise in_features (Full Rank)
+        self.rank = rank if rank is not None else in_features
         self.ortho_mode = ortho_mode
         
-        # 1. Deux bases distinctes : Vecteurs propres à DROITE (P) et à GAUCHE (L)
-        # Contrairement à la version quadratique, on ne suppose plus p_k = l_k
-        self.right_projections = nn.Linear(in_features, in_features, bias=bias)
-        self.left_projections = nn.Linear(in_features, in_features, bias=bias)
+        # 1. Projections vers l'espace de rang r (In -> Rank)
+        self.right_projections = nn.Linear(in_features, self.rank, bias=bias)
+        self.left_projections = nn.Linear(in_features, self.rank, bias=bias)
         
-        # 2. Contraintes d'Orthogonalité (optionnelles) sur les deux bases
+        # 2. Contraintes d'Orthogonalité
         if self.ortho_mode in ['hard', 'cayley']:
             map_type = 'cayley' if self.ortho_mode == 'cayley' else None
             torch.nn.utils.parametrizations.orthogonal(self.right_projections, "weight", orthogonal_map=map_type)
@@ -38,28 +41,20 @@ class SpectralBilinearLayer(nn.Module):
         elif self.ortho_mode == 'soft':
             init.orthogonal_(self.right_projections.weight)
             init.orthogonal_(self.left_projections.weight)
-            self.register_buffer('eye_target', torch.eye(in_features), persistent=False)
+            # La cible d'identité dépend maintenant du Rank
+            self.register_buffer('eye_target', torch.eye(self.rank), persistent=False)
         
-        # 3. Les Valeurs Propres (Lambdas) - Mélange les interactions scalaires
-        self.eigen_weights = nn.Linear(in_features, out_features, bias=True)
+        # 3. Les Valeurs Propres (Lambdas) : Rank -> Out
+        self.eigen_weights = nn.Linear(self.rank, out_features, bias=True)
         
         self._init_parameters()
 
     def _init_parameters(self) -> None:
-            # 1. Initialisation des bases de projection (P et L)
-            # On utilise Xavier Uniform pour une distribution aléatoire forte et équilibrée
             nn.init.xavier_uniform_(self.right_projections.weight, gain=1.5)
             nn.init.xavier_uniform_(self.left_projections.weight, gain=1.5)
-            
-            # 2. Initialisation des Valeurs Propres (Lambdas)
-            # Initialisation aléatoire uniforme pour le mélange spectral
             nn.init.xavier_uniform_(self.eigen_weights.weight, gain=1.5)
             
-            # 3. Mise à zéro des biais uniquement
-            # Comme demandé, on garde les biais neutres pour ne pas désharmoniser 
-            # la géométrie des formes bilinéaires au départ [cite: 39, 123]
             nn.init.zeros_(self.eigen_weights.bias)
-            
             if self.right_projections.bias is not None: 
                 nn.init.zeros_(self.right_projections.bias)
             if self.left_projections.bias is not None: 
@@ -69,10 +64,10 @@ class SpectralBilinearLayer(nn.Module):
         if self.ortho_mode != 'soft':
             return torch.tensor(0.0, device=self.right_projections.weight.device)
             
-        w_r = self.right_projections.weight
-        w_l = self.left_projections.weight
+        w_r = self.right_projections.weight # Shape: (Rank, In)
+        w_l = self.left_projections.weight # Shape: (Rank, In)
         
-        # On régularise les deux matrices pour qu'elles restent des bases orthogonales
+        # MM(W, W.t()) produit une matrice (Rank, Rank)
         loss_r = loss_fn(torch.mm(w_r, w_r.t()), self.eye_target)
         loss_l = loss_fn(torch.mm(w_l, w_l.t()), self.eye_target)
         
@@ -81,17 +76,14 @@ class SpectralBilinearLayer(nn.Module):
     def forward(self, x):
         # x shape: (Batch, In_Features)
         
-        # Étape A : Projections distinctes (Vecteurs propres gauche et droite)
-        # h_right = x @ P.T  |  h_left = x @ L.T
+        # A. Projection Low-Rank (Batch, Rank)
         h_right = self.right_projections(x)
         h_left = self.left_projections(x)
         
-        # Étape B : Interaction Bilinéaire (Produit point à point)
-        # Au lieu de h^2, on fait h_right * h_left
-        # Cela correspond à (x^T p_k) * (l_k^T x) dans le rapport 
+        # B. Interaction Bilinéaire dans l'espace réduit
         bilinear_interaction = h_right * h_left 
         
-        # C. Combinaison par les valeurs propres
+        # C. Combinaison (Rank -> Out)
         y = self.eigen_weights(bilinear_interaction)
         
         return y
@@ -100,19 +92,12 @@ class SpectralBillinearNet(nn.Module):
         def __init__(
             self, 
             layers_dim: List[int],          
+            rank_factor: float = 1.0, # Facteur de réduction du rang (ex: 0.5)
             ortho_mode: str = None, 
             use_final_linear: bool = False, 
             bias: bool = True, 
-            use_layernorm: bool = True
+            use_layernorm: bool = False
         ):
-            """
-            Args:
-                layers_dim (list): Liste des dimensions [in, hidden, ..., out].
-                ortho_mode (str): 'hard', 'cayley', 'soft', ou None.
-                use_final_linear (bool): Si True, la dernière couche est linéaire (standard pour classification).
-                use_layernorm (bool): Si True, ajoute une normalisation entre les couches cachées. 
-                                    Recommandé car les réseaux quadratiques peuvent faire exploser les valeurs.
-            """
             super().__init__()
             self.layers = nn.ModuleList()
             self.use_layernorm = use_layernorm
@@ -126,17 +111,24 @@ class SpectralBillinearNet(nn.Module):
                 in_d = layers_dim[i]
                 out_d = layers_dim[i+1]
                 
-                # --- A. Dernière Couche ---
                 if is_last_layer and use_final_linear:
                     self.layers.append(nn.Linear(in_d, out_d))
-                
-                # --- B. Couches Cachées / Spectrales ---
                 else:
+                    # Calcul du rang basé sur le facteur
+                    layer_rank = int(in_d * rank_factor) if rank_factor > 0 else in_d
+                    # Sécurité pour éviter rank=0
+                    layer_rank = max(1, layer_rank)
+
                     self.layers.append(
-                        SpectralBilinearLayer(in_d, out_d, ortho_mode=ortho_mode, bias=bias)
+                        SpectralBilinearLayer(
+                            in_d, 
+                            out_d, 
+                            rank=layer_rank, # Passage du rank
+                            ortho_mode=ortho_mode, 
+                            bias=bias
+                        )
                     )
                     
-                    # On ne met jamais de Norm après la toute dernière couche
                     if not is_last_layer and self.use_layernorm:
                         self.layers.append(nn.LayerNorm(out_d))
 
@@ -146,7 +138,6 @@ class SpectralBillinearNet(nn.Module):
             return x
 
         def get_total_ortho_loss(self, loss_fn: Callable) -> torch.Tensor:
-            """Récupère la loss d'orthogonalité totale du réseau."""
             device = next(self.parameters()).device
             total_loss = torch.tensor(0.0, device=device)
             for layer in self.layers:
@@ -160,22 +151,15 @@ class SpectralBillinearNet(nn.Module):
 
 class MultiBasisBilinearLayer(nn.Module):
     """
-    Couche Bilinéaire Spectrale Multi-Bases.
-    
-    Combine la puissance du SBN (interactions asymétriques Gauche/Droite)
-    avec l'approche Multi-Bases (plusieurs paires de bases en parallèle).
-    
-    Architecture :
-    1. L'entrée x est projetée sur H paires de bases (Left_i, Right_i).
-    2. On calcule H interactions bilinéaires : E_i = (x @ Right_i.T) * (x @ Left_i.T).
-    3. On concatène tout : [E_1, E_2, ..., E_H].
-    4. Une couche linéaire apprend les valeurs propres pour mélanger tout ça.
+    Couche Multi-Bases avec support Low-Rank.
+    H bases projettent x (In) vers H espaces de dimension (Rank).
     """
     def __init__(
         self, 
         in_features: int,          
         out_features: int, 
-        num_bases: int = 4,   # Nombre de paires de bases (H)
+        num_bases: int = 4,
+        rank: Optional[int] = None, # Nouveau
         ortho_mode: str = None, 
         bias: bool = True
     ):
@@ -183,28 +167,26 @@ class MultiBasisBilinearLayer(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.num_bases = num_bases
+        self.rank = rank if rank is not None else in_features
         self.ortho_mode = ortho_mode
 
-        # 1. Les H Paires de Bases (Listes de matrices de projection)
-        # Chaque base est une transformation complète : In -> In
-        # Contrairement au DSN simple, on a Right ET Left pour chaque base 'i'
+        # 1. Bases Low-Rank : In -> Rank
         self.right_bases = nn.ModuleList([
-            nn.Linear(in_features, in_features, bias=bias) for _ in range(num_bases)
+            nn.Linear(in_features, self.rank, bias=bias) for _ in range(num_bases)
         ])
         self.left_bases = nn.ModuleList([
-            nn.Linear(in_features, in_features, bias=bias) for _ in range(num_bases)
+            nn.Linear(in_features, self.rank, bias=bias) for _ in range(num_bases)
         ])
         
-        # Application des contraintes d'orthogonalité sur TOUTES les bases
         self._apply_ortho_constraints()
         
         if self.ortho_mode == 'soft':
-            self.register_buffer('eye_target', torch.eye(in_features), persistent=False)
+            # Cible pour (Rank, Rank)
+            self.register_buffer('eye_target', torch.eye(self.rank), persistent=False)
 
-        # 2. Les Valeurs Propres (H * N valeurs par neurone de sortie)
-        # Entrée : in_features * num_bases (concaténation)
-        # Sortie : out_features
-        self.eigen_weights = nn.Linear(in_features * num_bases, out_features, bias=True)
+        # 2. Mélange : Entrée = Rank * Num_Bases
+        total_hidden_dim = self.rank * num_bases
+        self.eigen_weights = nn.Linear(total_hidden_dim, out_features, bias=True)
         
         self._init_parameters()
 
@@ -219,7 +201,6 @@ class MultiBasisBilinearLayer(nn.Module):
                     init.orthogonal_(linear_layer.weight)
 
     def _init_parameters(self) -> None:
-        # Initialisation Xavier pour les projections
         for bases_list in [self.right_bases, self.left_bases]:
             for base in bases_list:
                 if self.ortho_mode not in ['hard', 'cayley']: 
@@ -227,46 +208,38 @@ class MultiBasisBilinearLayer(nn.Module):
                 if base.bias is not None: 
                     init.zeros_(base.bias)
         
-        # Initialisation des valeurs propres de mélange
         nn.init.xavier_uniform_(self.eigen_weights.weight, gain=1.0)
         init.zeros_(self.eigen_weights.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: (Batch, In_Features)
-        
         all_interactions = []
         
-        # 1. Calcul des interactions bilinéaires pour chaque paire de bases
         for i in range(self.num_bases):
-            right_proj = self.right_bases[i](x) # Projeter à droite
-            left_proj = self.left_bases[i](x)   # Projeter à gauche
+            # Projection : (Batch, Rank)
+            right_proj = self.right_bases[i](x) 
+            left_proj = self.left_bases[i](x)   
             
-            # Interaction Bilinéaire : Produit terme à terme
-            # energy = (x @ P_i.T) * (x @ L_i.T)
+            # Interaction : (Batch, Rank)
             interaction = right_proj * left_proj
-            
             all_interactions.append(interaction)
             
-        # 2. Concaténation de toutes les énergies
-        # Shape: (Batch, In_Features * Num_Bases)
+        # Concaténation : (Batch, Rank * Num_Bases)
         combined_interactions = torch.cat(all_interactions, dim=-1)
         
-        # 3. Combinaison linéaire finale
         y = self.eigen_weights(combined_interactions)
-        
         return y
 
     def get_ortho_loss(self, loss_fn: Callable) -> torch.Tensor:
-        """Calcule la perte d'orthogonalité cumulée sur les 2*H bases."""
         if self.ortho_mode != 'soft':
             return torch.tensor(0.0, device=self.eigen_weights.weight.device)
             
         total_loss = torch.tensor(0.0, device=self.eigen_weights.weight.device)
         
-        # On somme la loss pour chaque matrice de chaque liste
         for bases_list in [self.right_bases, self.left_bases]:
             for base in bases_list:
-                w = base.weight
+                w = base.weight # (Rank, In)
+                # Gram matrix sur la dimension Rank : (Rank, Rank)
                 gram = torch.mm(w, w.t())
                 total_loss += loss_fn(gram, self.eye_target)
             
@@ -274,14 +247,11 @@ class MultiBasisBilinearLayer(nn.Module):
 
 
 class DeepMultiBasisBilinearNet(nn.Module):
-    """
-    Réseau Profond SBN Multi-Bases.
-    C'est le "Flagship Model" : Profond, Bilinéaire, et Multi-Bases.
-    """
     def __init__(
         self, 
         layers_dim: List[int],
         num_bases: int = 4,
+        rank_factor: float = 1.0, # Facteur Low-Rank
         ortho_mode: str = 'hard',
         use_final_linear: bool = True,
         use_layernorm: bool = True,
@@ -303,40 +273,37 @@ class DeepMultiBasisBilinearNet(nn.Module):
             in_d = layers_dim[i]
             out_d = layers_dim[i+1]
             
-            # Cas A : Dernière Couche Linéaire (Classification/Regression)
             if is_last_layer and use_final_linear:
                 self.layers.append(nn.Linear(in_d, out_d, bias=bias))
-            
-            # Cas B : Couche SBN Multi-Bases
             else:
+                # Calcul du rank
+                layer_rank = int(in_d * rank_factor) if rank_factor > 0 else in_d
+                layer_rank = max(1, layer_rank)
+
                 self.layers.append(
                     MultiBasisBilinearLayer(
                         in_features=in_d, 
                         out_features=out_d, 
-                        num_bases=num_bases, 
+                        num_bases=num_bases,
+                        rank=layer_rank, 
                         ortho_mode=ortho_mode,
                         bias=bias
                     )
                 )
                 
-                # Normalisation
                 if not is_last_layer and self.use_layernorm:
                     self.layers.append(nn.LayerNorm(out_d))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
-            # Gestion des connexions résiduelles pour les couches SBN
             if isinstance(layer, MultiBasisBilinearLayer):
                 out = layer(x)
-                # Résiduel seulement si les dimensions matchent
                 if self.use_residual and x.shape == out.shape:
                     x = x + out
                 else:
                     x = out
             else:
-                # LayerNorm ou Linear Final
-                x = layer(x)
-                
+                x = layer(x)      
         return x
 
     def get_total_ortho_loss(self, loss_fn: Callable) -> torch.Tensor:
